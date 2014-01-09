@@ -1,0 +1,251 @@
+#!/usr/bin/env php
+<?php
+
+$m = new Mkcstub();
+$m->run();
+
+/**
+ * A tool for creating and maintaing C function stubs given an authoritative
+ * set of header files
+ */
+class Mkcstub {
+
+    const FUNCTION_REGEX_FMT = '@^([A-Za-z0-9_]+) ([A-Za-z0-9]+)_([A-Za-z0-9_]+)\(([A-Za-z0-9_\*, ]+)\)%s@m';
+    const DIVIDER = '// ============================================================================';
+
+    private $function_regex_prot;
+    private $function_regex_impl;
+
+    private $help;
+    private $quiet;
+    private $makeBackups;
+    private $hFiles;
+    private $numUpdatedFiles;
+
+    /** Run */
+    function run() {
+        $rc = 0;
+        $this->parseArgs();
+        if ($this->help) {
+            $this->showHelp();
+        } else {
+            $this->makeCStubs();
+        }
+    }
+
+    /** Main func */
+    private function makeCStubs() {
+        $hFiles = $this->hFiles ? $this->hFiles : glob('*.h');
+        $this->log(sprintf("Found %d header files", count($hFiles)));
+        foreach ($hFiles as $hFile) {
+            $this->log("{$hFile}:");
+            $namespaceProtos = $this->getNamespaceProtos($hFile);
+            $this->log(sprintf("    Found %d namespaces", count($namespaceProtos)));
+            foreach ($namespaceProtos as $namespace => $protos) {
+                $protosMap = [];
+                foreach ($protos as $proto) {
+                    $protosMap[$proto['name']] = $proto;
+                }
+                $this->log(sprintf("    Ensuring %d functions in %s namespace", count($protos), $namespace));
+                $this->ensureStubs($hFile, $namespace, $protosMap);
+            }
+        }
+        $this->log(sprintf("Updated %d source files", $this->numUpdatedFiles));
+    }
+
+    /** Ensure stubs exist */
+    private function ensureStubs($hFile, $namespace, $protosMap) {
+        $cFile = "{$namespace}.c";
+        if (!file_exists($cFile)) {
+            $this->createCFile($hFile, $cFile, $namespace, $protosMap);
+        } else {
+            $this->updateCFile($hFile, $cFile, $namespace, $protosMap);
+        }
+    }
+
+    /** Create a C file */
+    private function createCFile($hFile, $cFile, $namespace, $protosMap) {
+        $cFuncs = $this->getUpdatedCFuncs([], $namespace, $protosMap);
+        $hFileShort = basename($hFile);
+        $this->writeCFile($cFile, "#include \"{$hFileShort}\"", self::DIVIDER, $cFuncs);
+    }
+
+    /** Update a C file */
+    private function updateCFile($hFile, $cFile, $namespace, $protosMap) {
+        list($cFuncs, $sourceBefore, $sourceAfter) = $this->extractCFuncs($cFile);
+        $cFuncs = $this->getUpdatedCFuncs($cFuncs, $namespace, $protosMap);
+        $this->writeCFile($cFile, $sourceBefore, $sourceAfter, $cFuncs);
+    }
+
+    /** Write or overwrite a C file */
+    private function writeCFile($cFile, $sourceBefore, $sourceAfter, $cFuncs) {
+        $content = trim($sourceBefore) . "\n\n";
+        foreach ($cFuncs as $cFunc) {
+            $content .= "/** {$cFunc['comment']} */\n" .
+                rtrim($cFunc['first'], '; {') . " {\n" .
+                ($cFunc['body'] ? $cFunc['body'] . "\n" : '') .
+                "}\n\n";
+        }
+        $content .= trim($sourceAfter);
+        $content = trim($content) . "\n";
+        if (file_exists($cFile)) {
+            if (md5($content) == md5_file($cFile)) {
+                return;
+            } else if ($this->makeBackups) {
+                copy($cFile, "{$cFile}.bak");
+            }
+        }
+        $this->numUpdatedFiles += 1;
+        file_put_contents($cFile, $content);
+    }
+
+    /** Integrates protosMap into cFuncs */
+    private function getUpdatedCFuncs($cFuncs, $namespace, $protosMap) {
+        foreach ($protosMap as $name => $proto) {
+            if (!isset($cFuncs[$name])) {
+                $cFuncs[$name] = [
+                    'comment' => "TODO {$name}",
+                    'first' => $proto['line'],
+                    'body' => ''
+                ];
+            } else {
+                $cFuncs[$name]['first'] = $proto['line'];
+                if (!isset($cFuncs[$name]['comment'])) {
+                    $cFuncs[$name]['comment'] = "TODO {$name}";
+                }
+            }
+        }
+        return $this->getSortedCFuncs($cFuncs, $protosMap);
+    }
+
+    /** Sort C functions in the order of protosMap, unknown funcs last */
+    private function getSortedCFuncs($cFuncs, $protosMap) {
+        $sortedCFuncs = [];
+        foreach ($protosMap as $name => $proto) {
+            if (isset($cFuncs[$name])) {
+                $sortedCFuncs[$name] = $cFuncs[$name];
+            }
+        }
+        foreach ($cFuncs as $name => $cFunc) {
+            if (!isset($sortedCFuncs[$name])) {
+                $sortedCFuncs[$name] = $cFunc;
+            }
+        }
+        return $sortedCFuncs;
+    }
+
+    /** Extract C functions from $cFile */
+    private function extractCFuncs($cFile) {
+        $cFuncs = [];
+        $cLines = explode("\n", file_get_contents($cFile));
+        $sourceBefore = null;
+        $sourceAfter = '';
+        $i = 0;
+        $l = count($cLines);
+        $lastFuncLine = $l - 1;
+        while ($i < $l) {
+            $cLine = $cLines[$i];
+            if ($cLine == self::DIVIDER) {
+                $lastFuncLine = $i - 1;
+                break;
+            }
+            if (preg_match($this->function_regex_impl, $cLine, $m)) {
+                $name = $m[2] . '_' . $m[3];
+                $cFunc = [
+                    'comment' => "TODO {$name}",
+                    'first' => $m[0],
+                    'body' => null
+                ];
+                $fi = $i;
+                if ($i - 1 > 0 && substr($cLines[$i - 1], 0, 2) == '/*') {
+                    $cFunc['comment'] = preg_replace('@(/\*+\s*|\s*\*+/)@', '', $cLines[$i - 1]);
+                    $fi = $i - 1;
+                }
+                if ($sourceBefore === null) {
+                    $sourceBefore = implode("\n", array_slice($cLines, 0, $fi - 1));
+                }
+                for ($j = $i + 1; $j < $l; $j++) {
+                    if ($cLines[$j] == '}') {
+                        $cFunc['body'] = implode("\n", array_slice($cLines, $i + 1, ($j - 1) - $i));
+                        break;
+                    }
+                }
+                if ($cFunc['body'] === null) {
+                    break;
+                }
+                $cFuncs[$name] = $cFunc;
+                $i = $j + 1;
+            } else {
+                $i += 1;
+            }
+        }
+        $sourceAfter .= implode("\n", array_slice($cLines, $lastFuncLine));
+        return [$cFuncs, $sourceBefore, $sourceAfter];
+    }
+
+    /** Extract prototypes from $hFile */
+    private function getNamespaceProtos($hFile) {
+        $protos = [];
+        if (!is_readable($hFile) || !is_file($hFile)) {
+            return [];
+        }
+        $hFileSource = file_get_contents($hFile);
+        if (preg_match_all($this->function_regex_prot, $hFileSource, $m) > 0) {
+            foreach ($m[0] as $i => $line) {
+                $namespace = $m[2][$i];
+                if (!isset($protos[$namespace])) {
+                    $protos[$namespace] = [];
+                }
+                $protos[$namespace][] = [
+                    'line' => $line,
+                    'type' => $m[1][$i],
+                    'name' => $namespace . '_' . $m[3][$i],
+                    'args' => $m[4][$i]
+                ];
+            }
+        }
+        return $protos;
+    }
+
+    /** Parse command line args */
+    private function parseArgs() {
+        $opt = getopt('hqB');
+        $this->help = isset($opt['h']);
+        $this->quiet = isset($opt['q']);
+        $this->makeBackups = !isset($opt['B']);
+        $this->hFiles = [];
+        $fileArgs = $_SERVER['argv'];
+        array_shift($fileArgs);
+        foreach (array_reverse($fileArgs) as $fileArg) {
+            if (is_readable($fileArg) && is_file($fileArg)) {
+                $this->hFiles[] = $fileArg;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /** Show help */
+    private function showHelp() {
+        echo "Usage: php {$_SERVER['PHP_SELF']} -hqB HFILE...\n\n" .
+             "Makes stubs from prototypes in HFILEs or glob('*.h') if not specified.\n\n" .
+             "Options:\n" .
+             "    -h    show help\n" .
+             "    -q    quiet mode\n" .
+             "    -B    do not make bak files\n";
+    }
+
+    /** Output log line */
+    private function log($s) {
+        if (!$this->quiet) {
+            echo "{$s}\n";
+        }
+    }
+
+    /** Ctor */
+    function __construct() {
+        $this->function_regex_prot = sprintf(self::FUNCTION_REGEX_FMT, ';');
+        $this->function_regex_impl = sprintf(self::FUNCTION_REGEX_FMT, ' {');
+    }
+
+}
